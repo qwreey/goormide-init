@@ -67,7 +67,7 @@ if [ ! -e /config ]; then
 	HEAD="CONFIG" log "Config directory not found. create now"
 	mkdir -p /config
 	while [ ! -z "EDITOR" ]; do
-	HEAD="CONFIG" log "Please select editor for editing /config/env"
+		HEAD="CONFIG" log "Please select editor for editing /config/env"
 		printf "%s" "$CONFIG_BASE" > /config/env
 		printf "Which editor you like to edit configure file?:\n [1] vim\n [2] nvim\n [3] nano\n [4] emacs\n----------> "
 		read
