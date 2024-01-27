@@ -1,9 +1,5 @@
 #!/bin/bash
 
-# ============================================================
-#                           config
-# ============================================================
-
 CONFIG_BASE='#!/bin/bash
 # ======================================
 #    /config/env - goorm-init config
@@ -63,6 +59,10 @@ function indent {
 	cat - | sed "s/^/$ind/"
 }
 
+if [ "$(basename "$0")" == "$(which bash)" ] || [ "$(basename "$0")" == "$(which sh)" ]; then
+	HEAD="ERROR" log "This script cannot be executed with piping method. you must save this script anywhere"
+	exit
+fi
 if [ ! -e /config ]; then
 	HEAD="CONFIG" log "Config directory not found. create now"
 	mkdir -p /config
@@ -100,7 +100,7 @@ fi
 
 if [ -e /config/env ]; then
 	set -o allexport
-	source /config/.env
+	source /config/env
 	set +o allexport
 fi
 [ -e /config/BOOT_COMMAND ] && BOOT_COMMAND="$(cat /config/BOOT_COMMAND)"
@@ -112,6 +112,13 @@ fi
 
 _HOME=/home/$LINUX_USER
 SSH=$_HOME/.ssh
+
+if [ "$(realpath $0)" != "/etc/init.d/cloudinit" ]; then
+	log "Script file path must be /etc/init.d/cloudinit. Move this script to /etc/init.d/cloudinit"
+	mv "$(realpath $0)" /etc/init.d/cloudinit
+	eval /etc/init.d/cloudinit
+	exit
+fi
 
 function distro_update {
 	# Check current installed version
