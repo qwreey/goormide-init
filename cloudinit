@@ -1,0 +1,324 @@
+#!/bin/bash
+
+# ============================================================
+#                           config
+# ============================================================
+
+CONFIG_BASE='#!/bin/bash
+# ======================================
+#    /config/env - goorm-init config
+# ======================================
+# This file is goormide-init config script
+# You can save /config folder and load /config folder in another container
+# All configs will apply to another container
+
+LINUX_USER="qwreey" # Linux user name to use.
+GITHUB_NAME="qwreey" # Your github name. ssh auth keys will fetched from your account
+
+# Your Cloudflare ZeroTrust tunnel token. You can configure forwarding in one.dash.cloudflare.com
+# If you add ssh tunnel with localhost:5022 you should able to connect ssh
+# Sample of ~/.ssh/ssh_config
+# Host goorm
+#   HostName goorm.qwreey.moe
+#   ProxyCommand cloudflared access ssh --hostname goorm.qwreey.moe
+#   User qwreey # LINUX_USER here
+#   IdentityFile ~/.ssh/id_ed25519
+#   IdentitiesOnly yes
+CLOUDFLARE_TOKEN=""
+
+# Space separated package names. this packages will installed after ubuntu update
+REQUIRED_PACKAGES=""
+
+# Inline bash script. it will run every boot
+BOOT_COMMAND="
+	pm2 resurrect
+"
+
+# Inline bash script. run at first setup
+INIT_COMMAND="
+	corepack enable
+	npm -g i pm2
+"
+'
+
+# ============================================================
+
+me=$(whoami)
+function log {
+	if [[ -z "$HEAD" ]]; then
+		HEAD="CLOUDINIT"
+	fi
+	# https://unix.stackexchange.com/questions/200235/how-to-use-sed-to-manipulate-continuously-streaming-output
+	unbuffer printf "\e[32m[$HEAD - $me]\e[0m %s\n" "$1"
+}
+function indent {
+	ind=""
+	if [[ -z "$1" ]]; then
+		ind=" |- "
+	else
+		for i in {1..$1}; do
+			ind="$ind |- "
+		done
+	fi
+	cat - | sed "s/^/$ind/"
+}
+
+if [ ! -e /config ]; then
+	HEAD="CONFIG" log "Config directory not found. create now"
+	mkdir -p /config
+	while [ -z "EDITOR" ]; do
+	HEAD="CONFIG" log "Please select editor for editing /config/env"
+		printf "%s" "$CONFIG_BASE" > /config/env
+		printf "Which editor you like to edit configure file?:\n [1] vim\n [2] nvim\n [3] nano\n [4] emacs\n----------> "
+		read
+		case "$REPLY" in
+			"1")
+				HEAD="CONFIG" log "Install editor"
+				apt install vim -y
+				EDITOR=vim
+			;;
+			"2")
+				HEAD="CONFIG" log "Install editor"
+				apt install neovim -y
+				EDITOR=nvim
+			;;
+			"3")
+				HEAD="CONFIG" log "Install editor"
+				apt install nano -y
+				EDITOR=nano
+			;;
+			"4")
+				HEAD="CONFIG" log "Install editor"
+				apt install emacs -y
+				EDITOR=emacs
+			;;
+		esac
+	done
+	$EDITOR /config/env
+	HEAD="CONFIG" log "Config saved"
+fi
+
+if [ -e /config/env ]; then
+	set -o allexport
+	source /config/.env
+	set +o allexport
+fi
+[ -e /config/BOOT_COMMAND ] && BOOT_COMMAND="$(cat /config/BOOT_COMMAND)"
+[ -e /config/INIT_COMMAND ] && BOOT_COMMAND="$(cat /config/INIT_COMMAND)"
+[ -e /config/LINUX_USER ] && BOOT_COMMAND="$(cat /config/LINUX_USER)"
+[ -e /config/CLOUDFLARE_TOKEN ] && BOOT_COMMAND="$(cat /config/CLOUDFLARE_TOKEN)"
+[ -e /config/REQUIRED_PACKAGES ] && BOOT_COMMAND="$(cat /config/REQUIRED_PACKAGES)"
+[ -e /config/GITHUB_NAME ] && BOOT_COMMAND="$(cat /config/GITHUB_NAME)"
+
+_HOME=/home/$LINUX_USER
+SSH=$_HOME/.ssh
+
+function distro_update {
+	# Check current installed version
+	if [ "$(cat /etc/lsb-release | grep DISTRIB_RELEASE)" != "DISTRIB_RELEASE=18.04" ]; then
+		HEAD="DistroUpdate" log "Already up to date"
+		return 1
+	fi
+
+	# Update all packages
+	HEAD="DistroUpdate" log "Update apt database"
+	apt update |&indent
+	HEAD="DistroUpdate" log "Upgrade packages"
+	env DEBIAN_FRONTEND=noninteractive apt upgrade -y |&indent
+	HEAD="DistroUpdate" log "Install update manager"
+	apt install update-manager-core -y |&indent
+
+	# Workaround https://bugs.launchpad.net/ubuntu/+source/command-not-found/+bug/1876034
+	rm /etc/apt/apt.conf.d/docker-gzip-indexes |&indent
+	rm -rf /var/lib/apt/lists |&indent
+
+	# Perform distro update
+	HEAD="DistroUpdate" log "Update ubuntu release"
+	env DEBIAN_FRONTEND=noninteractive do-release-upgrade -f DistUpgradeViewNonInteractive |&indent
+
+	# Cleanup
+	HEAD="DistroUpdate" log "Cleanup"
+	apt autoremove -y |&indent
+	apt autoclean |&indent
+
+	HEAD="DistroUpdate" log "OK!"
+	return 0
+}
+
+function setup_cloudflare {
+	# Check installed
+	which cloudflared > /dev/null
+	if [ "x$?" != "x1" ]; then
+		HEAD="Cloudflared" log "Already installed"
+		return 0
+	fi
+
+	# Install cloudflared package
+	HEAD="Cloudflared" log "Pulling package"
+	curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb |&indent
+	HEAD "Cloudflared" log "Install package"
+	sudo dpkg -i cloudflared.deb |&indent
+	rm cloudflared.deb |&indent
+
+	# Install cloudflared service
+	HEAD "Cloudflared" log "Install cloudflared service"
+	cloudflared service install $CLOUDFLARE_TOKEN |&indent
+	HEAD "Cloudflared" log "OK!"
+}
+
+function create_user {
+	# Create user
+	HEAD="UserSetup" log "Create linux user $LINUX_USER"
+	adduser $LINUX_USER\
+		--disabled-password\
+		--home $_HOME\
+		--shell /bin/bash\
+		--gecos ""\
+		|&indent
+	usermod qwreey -aG sudo |&indent
+
+	# Create sshd host key
+	HEAD="UserSetup - SSH" log "Create ssh host keys"
+	mkdir -p $SSH
+	ssh-keygen -q -N "" -t ed25519 -f $SSH/ssh_host_ed25519_key |&indent
+	ssh-keygen -q -N "" -t ecdsa -f $SSH/ssh_host_ecdsa_key |&indent
+	ssh-keygen -q -N "" -t rsa -b 4096 -f $SSH/ssh_host_rsa_key |&indent
+	ssh-keygen -q -N "" -t dsa -f $SSH/ssh_host_dsa_key |&indent
+
+	# Add authorized keys (fetching from github)
+	HEAD="UserSetup - SSH" log "Fetching ssh authorized_keys from github account $GITHUB_NAME"
+	curl "https://api.github.com/users/$GITHUB_NAME/keys"\
+		| grep 'key":'\
+		| sed -e 's/.*"\(ssh-.*\)".*/\1/'\
+		> $SSH/authorized_keys
+	echo "# $SSH/authorized_keys" |&indent
+	cat $SSH/authorized_keys |&indent
+
+	# Add sshd_config
+	HEAD="UserSetup - SSH" log "Write sshd_config"
+	cat <<-EOF > $SSH/sshd_config
+		Port 5022
+		ListenAddress 127.0.0.1
+		Protocol 2
+
+		HostKey $SSH/ssh_host_dsa_key
+		HostKey $SSH/ssh_host_ecdsa_key
+		HostKey $SSH/ssh_host_ed25519_key
+
+		SyslogFacility AUTH
+		LogLevel INFO
+
+		LoginGraceTime 120
+		PermitRootLogin no
+		StrictModes yes
+
+		PubkeyAuthentication yes
+		AuthorizedKeysFile %h/.ssh/authorized_keys
+		UsePrivilegeSeparation no
+		UsePAM no
+		Subsystem sftp /usr/lib/openssh/sftp-server
+		AcceptEnv LANG LC_*
+
+		IgnoreRhosts yes
+		HostbasedAuthentication no
+		IgnoreUserKnownHosts no
+		ChallengeResponseAuthentication no
+		PasswordAuthentication no
+		X11Forwarding yes
+		X11DisplayOffset 10
+		PrintMotd no
+		PrintLastLog yes
+		TCPKeepAlive yes
+	EOF
+
+	# Update owner
+	HEAD="UserSetup" log "Update owner of $_HOME"
+	chown qwreey -R $_HOME
+	HEAD="UserSetup" log "OK!"
+}
+
+function setup_user {
+	# Install nodejs
+	HEAD="UserSetup - NODE" log "Install nvm"
+	curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash |&indent
+	HEAD="UserSetup - NODE" log "Cloning fnvm"
+	git clone https://github.com/qwreey75/fnvm.git $_HOME/.fnvm --depth 1 |&indent
+	HEAD="UserSetup - NODE" log "Install node"
+	export NVM_DIR="$HOME/.nvm"
+	source "$NVM_DIR/nvm.sh" --no-use
+	nvm install node |&indent
+	nvm use node >/dev/null
+	HEAD="UserSetup - NODE" log "Update default node version to $(node --version)"
+	node --version > $_HOME/.nvmrc.default
+	HEAD="UserSetup - NODE" log "Update fnvm"
+	source $_HOME/.fnvm/fnvm.sh; FNVM_DIR=$_HOME/.fnvm fnvm_update |&indent
+}
+
+function ensure_packages {
+	[ "x$REQUIRED_PACKAGES" == "x" ] && return
+	eval "apt install $REQUIRE_PACKAGES -y"
+}
+
+if [ "$1" == "FN_init" ]; then
+	init
+	exit
+fi
+
+# Loaded and root. execute script in user
+if [ -e $_HOME/.loaded ] && [ "x$(whoami)" == "xroot" ]; then
+	log "Login to $LINUX_USER"
+	su $LINUX_USER $0
+# Not loaded and root. try root setup
+elif [ "x$(whoami)" == "xroot" ]; then
+	log "Checking distro updates"
+	distro_update |&indent
+	[ "${PIPESTATUS[0]}" == "0" ]\
+	&& log "Distro version updated. restart container is required. run this script after restarting container"\
+	&& exit
+
+	log "Install user selected packages"
+	ensure_packages |&indent
+
+	log "Create user"
+	create_user |&indent
+
+	log "Checking cloudflare setup"
+	setup_cloudflare |&indent
+
+	log "Login to $LINUX_USER"
+	su $LINUX_USER $0
+
+# Not loaded. load user
+elif [ ! -e $_HOME/.loaded ]; then
+	# Setup user (install node)
+	log "Setup user"
+	setup_user |&indent
+
+	# Run user created init script
+	bash -c "source \$HOME/.fnvm/fnvm.sh; FNVM_DIR=\$HOME/.fnvm NVM_DIR=\$HOME/.nvm fnvm_use \"\$(cat \$HOME/.nvmrc.default)\"; bash -c '$INIT_COMMAND'" |&indent
+
+	# Create loaded status file
+	log "Save user loaded status"
+	touch $_HOME/.loaded
+	chown $LINUX_USER $_HOME/.loaded
+	bash $0
+
+# Loaded and user. execute startup function
+else
+	# Load node
+	log "Startup"
+	HEAD="UserBoot" log="Sourcing fnvm"
+	source $_HOME/.fnvm/fnvm.sh
+	FNVM_NVMDIR=$_HOME/.nvm FNVM_DIR=$_HOME/.fnvm fnvm_init
+	FNVM_DIR=$_HOME/.fnvm NVM_DIR=$_HOME/.nvm fnvm_use "$(cat $_HOME/.nvmrc.default)" |&indent
+
+	# Load sshd
+	HEAD="UserBoot" log="Start sshd"
+	pkill -u $LINUX_USER sshd
+	$(which sshd) -f $SSH/sshd_config |&indent
+
+	# Run user created startup file
+	HEAD="UserBoot" log="Run startup"
+	bash -c "$BOOT_COMMAND" |&indent
+fi
+
